@@ -1,0 +1,5 @@
+test-db
+*.o
+*.so
+*~
+logfile
