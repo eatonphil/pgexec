@@ -1,4 +1,4 @@
-# pgexec: Messing with Postgres query execution
+# pgexec: Messing with Postgres query execution and hook infrastructure
 
 Build and install debug Postgres from source:
 
