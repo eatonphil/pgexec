@@ -1,5 +1,5 @@
-drop table if exists x;
-create table x(a int);
-INSERT INTO x VALUES (23), (101);
-select a from x;
-select a from x where a = 1;
+DROP TABLE IF EXISTS x;
+CREATE TABLE x(a INT);
+INSERT INTO x VALUES (23), (101); -- This is ignored at the moment.
+SELECT a FROM x;
+SELECT a FROM x WHERE a = 1; -- But filtering works.

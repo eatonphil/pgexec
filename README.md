@@ -33,5 +33,25 @@ $ /usr/local/pgsql/bin/postgres --config-file=$(pwd)/test-db/postgresql.conf -D 
 In a new window/tab/whatever, run `test.sql`:
 
 ```console
+$ cat test.sql
+DROP TABLE IF EXISTS x;
+CREATE TABLE x(a INT);
+INSERT INTO x VALUES (23), (101); -- This is ignored at the moment.
+SELECT a FROM x;
+SELECT a FROM x WHERE a = 1; -- But filtering works.
 $ /usr/local/pgsql/bin/psql -h localhost postgres -f test.sql
+/usr/local/pgsql/bin/psql -h localhost postgres -f test.sql
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ a
+---
+ 0
+ 1
+(2 rows)
+
+ a
+---
+ 1
+(1 row)
 ```
