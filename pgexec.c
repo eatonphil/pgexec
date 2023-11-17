@@ -52,11 +52,11 @@ static void buffer_append(PGExec_Buffer* buf, char* c, size_t chars) {
   buf->offset += chars;
 }
 
-/* static void buffer_appendf( */
-/*   PGExec_Buffer *, */
-/*   const char* restrict, */
-/*   ... */
-/* ) __attribute__ ((format (gnu_printf, 2, 3))); */
+static void buffer_appendf(
+  PGExec_Buffer *,
+  const char* restrict,
+  ...
+) __attribute__ ((format (gnu_printf, 2, 3)));
 
 static void buffer_appendf(PGExec_Buffer *buf, const char* restrict fmt, ...) {
   // First figure out how long the result will be.
