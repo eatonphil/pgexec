@@ -1,16 +1,13 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#include "catalog/pg_operator.h"
-#include "executor/executor.h"
-#include "nodes/nodes.h"
-#include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "executor/executor.h"
+#include "catalog/pg_operator.h"
 #include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
-
-static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 
 typedef struct {
   char* mem;
@@ -28,12 +25,15 @@ static void buffer_resize_to_fit_additional(PGExec_Buffer* buf, size_t additiona
   char* new = {};
   size_t newsize = 0;
 
+  Assert(additional >= 0);
+
   if (buf->offset + additional < buf->len) {
     return;
   }
 
   newsize = (buf->offset + additional) * 2;
   new = (char*)malloc(sizeof(char) * newsize);
+  Assert(new != NULL);
   memcpy(new, buf->mem, buf->len * sizeof(char));
   free(buf->mem);
   buf->len = newsize;
@@ -64,6 +64,7 @@ static void buffer_appendf(PGExec_Buffer *buf, const char* restrict fmt, ...) {
   va_list arglist;
   va_start(arglist, fmt);
   chars = vsnprintf(0, 0, fmt, arglist);
+  Assert(chars >= 0); // TODO: error handling.
 
   // Resize to fit result.
   buffer_resize_to_fit_additional(buf, chars);
@@ -71,7 +72,8 @@ static void buffer_appendf(PGExec_Buffer *buf, const char* restrict fmt, ...) {
   // Actually do the printf into buf.
   va_end(arglist);
   va_start(arglist, fmt);
-  vsprintf(buf->mem + buf->offset, fmt, arglist);
+  chars = vsprintf(buf->mem + buf->offset, fmt, arglist);
+  Assert(chars >= 0); // TODO: error handling.
   buf->offset += chars;
   va_end(arglist);
 }
@@ -87,7 +89,7 @@ static char* buffer_cstring(PGExec_Buffer* buf) {
     buf->mem[buf->offset] = 0;
   }
 
-  // Offset should stay the same-> This is a fake NULL->
+  // Offset should stay the same. This is a fake NULL.
   Assert(buf->offset == prev_offset);
 
   return buf->mem;
@@ -97,13 +99,15 @@ static void buffer_free(PGExec_Buffer* buf) {
   free(buf->mem);
 }
 
-static void buffer_print_list(PGExec_Buffer*, List*, char*, EState*);
-static void buffer_print_expr(PGExec_Buffer*, Expr*, EState*);
+static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 
-static void buffer_print_op(PGExec_Buffer* buf, OpExpr* op, EState* estate) {
+static void buffer_print_expr(PGExec_Buffer*, PlannedStmt*, Node*);
+static void buffer_print_list(PGExec_Buffer*, PlannedStmt*, List*, char*);
+
+static void buffer_print_opexpr(PGExec_Buffer* buf, PlannedStmt* stmt, OpExpr* op) {
   HeapTuple opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
 
-  buffer_print_expr(buf, lfirst(list_nth_cell(op->args, 0)), estate);
+  buffer_print_expr(buf, stmt, lfirst(list_nth_cell(op->args, 0)));
 
   if (HeapTupleIsValid(opertup)) {
     Form_pg_operator operator = (Form_pg_operator)GETSTRUCT(opertup);
@@ -114,23 +118,10 @@ static void buffer_print_op(PGExec_Buffer* buf, OpExpr* op, EState* estate) {
   }
 
   // TODO: Support single operand operations.
-  buffer_print_expr(buf, lfirst(list_nth_cell(op->args, 1)), estate);
+  buffer_print_expr(buf, stmt, lfirst(list_nth_cell(op->args, 1)));
 }
 
-static void buffer_print_var(PGExec_Buffer* buf, Var* var, EState *estate) {
-  RangeTblEntry* rte = list_nth(estate->es_range_table, var->varno - 1);
-
-  char* name;
-  if (var->varattno > 0) {
-    name = get_attname(rte->relid, var->varattno, false);
-    buffer_appendz(buf, name);
-    pfree(name);
-  } else {
-    buffer_appendz(buf, "[Unsupported varrtno type]");
-  }
-}
-
-static void buffer_print_const(PGExec_Buffer* buf, Const* cnst, EState *estate) {
+static void buffer_print_const(PGExec_Buffer* buf, Const* cnst) {
   switch (cnst->consttype) {
   case INT4OID:
     int32 val = DatumGetInt32(cnst->constvalue);
@@ -142,73 +133,107 @@ static void buffer_print_const(PGExec_Buffer* buf, Const* cnst, EState *estate) 
   }
 }
 
-static void buffer_print_expr(PGExec_Buffer* buf, Expr* expr, EState* estate) {
-  if (expr == NULL) {
-    // TODO: Should print out here?
+static void buffer_print_var(PGExec_Buffer* buf, PlannedStmt* stmt, Var* var) {
+  char* name = NULL;
+  RangeTblEntry* rte = list_nth(stmt->rtable, var->varno-1);
+  if (rte->rtekind != RTE_RELATION) {
+    elog(LOG, "[Unsupported relation type for var: %d].", rte->rtekind);
     return;
   }
 
+  name = get_attname(rte->relid, var->varattno, false);
+  buffer_appendz(buf, name);
+  pfree(name);
+}
+
+static void buffer_print_expr(PGExec_Buffer* buf, PlannedStmt* stmt, Node* expr) {
   switch (nodeTag(expr)) {
-  case T_Var:
-    buffer_print_var(buf, (Var*)expr, estate);
+  case T_Const:
+    buffer_print_const(buf, (Const*)expr);
     break;
 
-  case T_Const:
-    buffer_print_const(buf, (Const*)expr, estate);
+  case T_Var:
+    buffer_print_var(buf, stmt, (Var*)expr);
     break;
 
   case T_TargetEntry:
-    buffer_print_expr(buf, ((TargetEntry*)expr)->expr, estate);
+    buffer_print_expr(buf, stmt, (Node*)((TargetEntry*)expr)->expr);
     break;
 
   case T_OpExpr:
-    buffer_print_op(buf, (OpExpr*)expr, estate);
+    buffer_print_opexpr(buf, stmt, (OpExpr*)expr);
     break;
 
   default:
-    buffer_appendf(buf, "[unclear: %d]", nodeTag(expr));
+    buffer_appendf(buf, "[Unknown: %d]", nodeTag(expr));
   }
 }
 
-static void buffer_print_list(
-  PGExec_Buffer* buf,
-  List* list,
-  char* sep,
-  EState* estate
-) {
-  ListCell *cell = NULL;
+static void buffer_print_list(PGExec_Buffer* buf, PlannedStmt* stmt, List* list, char* sep) {
+  ListCell* cell = NULL;
   bool first = true;
+
   foreach(cell, list) {
     if (!first) {
       buffer_appendz(buf, sep);
     }
+
     first = false;
-    buffer_print_expr(buf, lfirst(cell), estate);
+    buffer_print_expr(buf, stmt, (Node*)lfirst(cell));
   }
 }
 
-static void print_selectplan(Plan* plan, EState* estate) {
-  RangeTblEntry* rte = list_nth(
-    estate->es_range_table,
-    ((SeqScan*)plan)->scan.scanrelid - 1);
-  Relation relation = RelationIdGetRelation(rte->relid);
-  char* table = NameStr(relation->rd_rel->relname);
-
-  PGExec_Buffer buf = {};
-  buffer_init(&buf);
-
-  buffer_appendz(&buf, "SELECT ");
-  buffer_print_list(&buf, plan->targetlist, ", ", estate);
-  buffer_appendf(&buf, " FROM %s", table);
-  if (plan->qual != NULL) {
-    buffer_appendz(&buf, " WHERE ");
-    buffer_print_list(&buf, plan->qual, " AND ", estate);
+static void buffer_print_where(PGExec_Buffer* buf, QueryDesc* queryDesc, Plan* plan) {
+  if (plan->qual == NULL) {
+    return;
   }
 
-  elog(LOG, "QUERY: { %s }", buffer_cstring(&buf));
+  buffer_appendz(buf, " WHERE ");
+  buffer_print_list(buf, queryDesc->plannedstmt, plan->qual, " AND ");
+}
 
-  buffer_free(&buf);
+static void buffer_print_select_columns(PGExec_Buffer* buf, QueryDesc* queryDesc, Plan* plan) {
+  if (plan->targetlist == NULL) {
+    return;
+  }
+
+  buffer_print_list(buf, queryDesc->plannedstmt, plan->targetlist, ", ");
+}
+
+static void print_plan(QueryDesc* queryDesc) {
+  SeqScan* scan = NULL;
+  RangeTblEntry* rte = NULL;
+  Relation relation = {};
+  char* tablename = NULL;
+  Plan* plan = queryDesc->plannedstmt->planTree;
+  PGExec_Buffer buf = {};
+  
+  if (plan->type != T_SeqScan) {
+    elog(LOG, "[pgexec] Unsupported plan type.");
+    return;
+  }
+
+  scan = (SeqScan*)plan;
+  rte = list_nth(queryDesc->plannedstmt->rtable, scan->scan.scanrelid-1);
+  if (rte->rtekind != RTE_RELATION) {
+    elog(LOG, "[pgexec] Unsupported FROM type: %d.", rte->rtekind);
+    return;
+  }
+
+  buffer_init(&buf);
+
+  relation = RelationIdGetRelation(rte->relid);
+  tablename = NameStr(relation->rd_rel->relname);
+
+  buffer_appendz(&buf, "SELECT ");
+  buffer_print_select_columns(&buf, queryDesc, plan);
+  buffer_appendf(&buf, " FROM %s", tablename);
+  buffer_print_where(&buf, queryDesc, plan);
+
+  elog(LOG, "[pgexec] %s", buffer_cstring(&buf));
+
   RelationClose(relation);
+  buffer_free(&buf);
 }
 
 static void pgexec_run_hook(
@@ -217,62 +242,8 @@ static void pgexec_run_hook(
   uint64 count,
   bool execute_once
 ) {
-  DestReceiver* dest = queryDesc->dest;
-  TupleTableSlot* slot = NULL;
-  size_t i = 0;
-
-  bool fallback = true;
-  Relation relation = NULL;
-  char* table = NULL;
-  ExprContext* econtext = NULL;
-
-  if (queryDesc->operation == CMD_SELECT) {
-    if (nodeTag(queryDesc->planstate) == T_SeqScanState) {
-      relation = ((SeqScanState*)queryDesc->planstate)->ss.ss_currentRelation;
-      table = NameStr(relation->rd_rel->relname);
-      if (strcmp(table, "x") == 0) {
-	fallback = false;
-      }
-    } else {
-      //elog(LOG, "UNKNOWN PLAN TYPE: %d\n", nodeTag(queryDesc->planstate));
-    }
-  }
-
-  if (fallback) {
-    //elog(LOG, "FALLING BACK!\n");
-    Assert(prev_executor_run_hook != NULL);
-    return prev_executor_run_hook(queryDesc, direction, count, execute_once);
-  } else {
-    //elog(LOG, "NOT FALLING BACK, TABLE IS: %s", table);
-  }
-
-  print_selectplan(queryDesc->planstate->plan, queryDesc->estate);
-
-  dest->rStartup(dest, queryDesc->operation, queryDesc->tupDesc);
-
-  slot = MakeTupleTableSlot(queryDesc->tupDesc, &TTSOpsVirtual);
-  slot->tts_nvalid = 1;
-  slot->tts_values = (Datum*)malloc(sizeof(Datum) * slot->tts_nvalid);
-  slot->tts_isnull = (bool*)malloc(sizeof(bool) * slot->tts_nvalid);
-  for (i = 0; i < 2; i++) {
-    ExecClearTuple(slot);
-    slot->tts_values[0] = Int32GetDatum(i);
-    slot->tts_isnull[0] = false;
-    ExecStoreVirtualTuple(slot);
-
-    econtext = GetPerTupleExprContext(queryDesc->estate);
-    Assert(econtext != NULL);
-    econtext->ecxt_scantuple = slot;
-    if (!ExecQual(queryDesc->planstate->qual, econtext)) {
-      continue;
-    }
-
-    Assert(dest->receiveSlot(slot, dest) == (i != 2));
-  }
-
-  ExecDropSingleTupleTableSlot(slot);
-
-  dest->rShutdown(dest);
+  print_plan(queryDesc);
+  return prev_executor_run_hook(queryDesc, direction, count, execute_once);
 }
 
 void _PG_init(void) {
